@@ -329,6 +329,7 @@ struct CastAwayTransferWriteLeadingOneDim
 
 } // namespace
 
+
 FailureOr<Value>
 mlir::vector::castAwayContractionLeadingOneDim(vector::ContractionOp contractOp,
                                                MaskingOpInterface maskingOp,
