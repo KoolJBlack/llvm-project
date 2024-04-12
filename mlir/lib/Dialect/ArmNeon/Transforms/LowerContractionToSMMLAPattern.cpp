@@ -135,30 +135,19 @@ public:
     llvm::dbgs() << "isVecmat: " << isVecmat << "\n";
 
     int64_t kTiles = dimK / 8;
-    bool isKTiles = kTiles > 1;
-    llvm::dbgs() << "kTiles: " << kTiles << " isKTiles: " << isKTiles << "\n";
+    llvm::dbgs() << "kTiles: " << kTiles << "\n";
 
     // Initial accumulator for the final result. This is the un-tiled result if
     // tiling is done.
     llvm::dbgs() << "The original result type: ";
     op.getResultType().dump();
     SmallVector<int64_t> resultShape = SmallVector<int64_t>(op.getResultType().cast<VectorType>().getShape());
-    if (isKTiles) {
-      llvm::dbgs() << "Temporary tiling of k dim by "<< kTiles << "\n";
-      resultShape.insert(resultShape.begin(), kTiles);
-    }
     auto resultType = VectorType::get(resultShape, op.getResultType().cast<VectorType>().getElementType());
-
-    // llvm::dbgs() << "Checking the resultShape SmallVector: ";
-    // for(auto val : resultShape) {
-    //   llvm::dbgs() << val << ",";
-    // }
-    // llvm::dbgs() << "\n";
     Value result = rewriter.create<arith::ConstantOp>(
         loc, resultType , rewriter.getZeroAttr(resultType));
 
-    llvm::dbgs() << "The updated result type: ";
-    result.getType().dump();
+    // Keep track of the previous accumulator when tiling over K
+    Value kAcc;
     for (SmallVector<int64_t> offsets :
          StaticTileOffsetRange(unrolledSize, smmlaShape, loopOrder)) {
       auto kTileIndex = offsets[offsets.size() - 1] / 8;
@@ -225,10 +214,15 @@ public:
       auto collapsedRes = rewriter.createOrFold<vector::ShapeCastOp>(
           tiledAcc.getLoc(), collapsedOutputType, tiledAcc);
 
+      if(kTileIndex != 0) {
+        collapsedRes = kAcc;
+      }
+
       // Insert contract op
       auto smmlaOp = rewriter.createOrFold<arm_neon::SmmlaOp>(
           op.getLoc(), collapsedRes.getType(), collapsedRes, collapsedLhs,
           collapsedRhs);
+      kAcc = smmlaOp;
 
       // Reshape output back to 2D
       Value tiledRes = rewriter.createOrFold<vector::ShapeCastOp>(
@@ -239,29 +233,12 @@ public:
         tiledRes = rewriter.createOrFold<vector::ExtractOp>(loc, tiledRes, 0);
       }
 
-      // for k tiling, we must insert into a result with an additional dim for the K tiles.
-      // Update the accOffsets and strides to account for additional dim
-      if(isKTiles) {
-        accOffsets.insert(accOffsets.begin(), kTileIndex);
-      }
-
       // Insert the tiled result back into the non tiled result of the
       // contract op.
       SmallVector<int64_t> strides(
-          tiledAcc.getType().cast<ShapedType>().getRank(), 1);
+          tiledRes.getType().cast<ShapedType>().getRank(), 1);
       result = rewriter.createOrFold<vector::InsertStridedSliceOp>(
           loc, tiledRes, result, accOffsets, strides);
-    }
-
-    // If there are k tiles, reduce along the k tile dim
-    if(isKTiles) {
-      auto reductionAcc = rewriter.create<arith::ConstantOp>(
-              loc, op.getResultType(), rewriter.getZeroAttr(op.getResultType()));
-      auto reductionMask = SmallVector<bool>(op.getResultType().cast<ShapedType>().getRank(), false);
-      reductionMask.insert(reductionMask.begin(), true);
-      result = rewriter.createOrFold<vector::MultiDimReductionOp>(loc, result, reductionAcc, reductionMask ,vector::CombiningKind::ADD);
-      // result = rewriter.createOrFold<vector::MultiDimReductionOp>(loc,vector::CombiningKind::ADD, result, reductionAcc, {0});
-      result.dump();
     }
 
     rewriter.replaceOp(op, result);
