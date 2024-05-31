@@ -764,8 +764,9 @@ static LogicalResult alignedConversionPrecondition(PatternRewriter &rewriter,
   unsigned dstElemBitwidth = dstType.getElementTypeBitWidth();
 
   // Only {s}i4 -> (size_of({{s}i/f}) >= 8) are supported for now.
-  if (srcElemBitwidth != 4 || dstElemBitwidth < 8 ||
-      (dstElemBitwidth % srcElemBitwidth) != 0)
+  if ((srcElemBitwidth != 4 &&srcElemBitwidth != 2 && srcElemBitwidth != 1  )
+  || dstElemBitwidth < 8
+     || (dstElemBitwidth % srcElemBitwidth) != 0)
     return rewriter.notifyMatchFailure(op, "Not a supported aligned case");
 
   if ((srcType.getShape().back() % 2) != 0)
@@ -885,31 +886,84 @@ static Value rewriteI4ToI8SignedExt(PatternRewriter &rewriter, Location loc,
 /// LLVM to scramble with peephole optimizations.
 static Value rewriteI4ToI8UnsignedExt(PatternRewriter &rewriter, Location loc,
                                       Value srcValue) {
+  int64_t srcBitWidth = cast<VectorType>(srcValue.getType()).getElementTypeBitWidth();
+  constexpr int64_t destBitWidth = 8;
+  int64_t srcDestBitwidthFactor = destBitWidth / srcBitWidth; // factor to scale up to dest bitwidth [2, 4, 8]
+  assert(srcDestBitwidthFactor % 2 == 0 && "Unsupported srcDestBitwidthFactor");
+
   VectorType srcVecType = cast<VectorType>(srcValue.getType());
-  assert(srcVecType.getElementType().isSignlessInteger(4) &&
-         "Expected i4 type");
+  assert(srcVecType.getElementType().isSignlessInteger(srcBitWidth) && "Input does not match srcBitWidth");
 
   // 1. Generate a bitcast vector<Xxi4> -> vector<X/2xi8>.
-  SmallVector<int64_t> i8VecShape = llvm::to_vector(srcVecType.getShape());
-  constexpr int64_t i4Toi8BitwidthFactor = 2;
-  i8VecShape.back() = i8VecShape.back() / i4Toi8BitwidthFactor;
-  auto i8VecType = VectorType::get(i8VecShape, rewriter.getI8Type());
-  Value i8Vector = rewriter.create<vector::BitCastOp>(loc, i8VecType, srcValue);
+  SmallVector<int64_t> bitcastVecShape = llvm::to_vector(srcVecType.getShape());
+  bitcastVecShape.back() = bitcastVecShape.back() / srcDestBitwidthFactor;
+  auto bitcastVecType = VectorType::get(bitcastVecShape, rewriter.getIntegerType(destBitWidth));
+  Value bitCastVal = rewriter.create<vector::BitCastOp>(loc, bitcastVecType, srcValue);
 
-  // 2 Extend the i4 elements using shifts & masking. Low i4 elements of each
-  //  byte are placed in one vector and the high i4 elements in another vector.
-  constexpr uint8_t lowBitsMask = 15; // Equivalent to [00001111] bit mask
-  auto lowBitsMaskValues = rewriter.create<arith::ConstantOp>(
-      loc, DenseElementsAttr::get(i8VecType, lowBitsMask));
-  Value low = rewriter.create<arith::AndIOp>(loc, i8VecType, i8Vector,
-                                             lowBitsMaskValues);
-  constexpr int8_t highBitsToShift = 4;
-  auto highShiftValues = rewriter.create<arith::ConstantOp>(
-      loc, DenseElementsAttr::get(i8VecType, highBitsToShift));
-  Value high = rewriter.create<arith::ShRUIOp>(loc, i8Vector, highShiftValues);
+  uint8_t bitMask;
+  switch(srcBitWidth) {
+    case 4:
+    bitMask = 15; // Equivalent to [00001111] bit mask
+    break;
+    case 2:
+    bitMask = 3; // Equivalent to [00000011] bit mask
+    break;
+    case 1:
+    bitMask = 1; // Equivalent to [000000001] bit mask
+    break;
+    default:
+    assert(false && "Unsupported srcBitWidth");
+    break;
+  }
 
-  // 3. Interleave low and high i8 elements.
-  return rewriter.create<vector::InterleaveOp>(loc, low, high);
+  // 2. Generate bit masks shifted to align with each val in src. Apply mask, then shift remaining bits to lowest position.
+  const uint8_t bitCastCount = srcDestBitwidthFactor;
+  SmallVector<Value> srsBitCastVals;
+  for(int i=0; i < bitCastCount; ++i) {
+    uint8_t shiftDist = i * srcBitWidth;
+    uint8_t shiftedMask = bitMask << shiftDist;
+
+    // TODO: AVOID mask for the final iteration
+    // Mask bits except for the highest order bits which will fully shifted down.
+    Value maskedShiftBitsVal = bitCastVal;
+    if (i < bitCastCount - 1) {
+    auto bitMaskValues = rewriter.create<arith::ConstantOp>(
+        loc, DenseElementsAttr::get(bitcastVecType, shiftedMask));
+    maskedShiftBitsVal = rewriter.create<arith::AndIOp>(loc, bitcastVecType, bitCastVal,
+                                                bitMaskValues);
+    }
+    // Shift masked bits down when necessary.
+    if (i > 0) {
+      auto shiftDistVal = rewriter.create<arith::ConstantOp>(
+          loc, DenseElementsAttr::get(bitcastVecType, shiftDist));
+      maskedShiftBitsVal = rewriter.create<arith::ShRUIOp>(loc, maskedShiftBitsVal, shiftDistVal);
+    }
+
+    srsBitCastVals.push_back(maskedShiftBitsVal);
+  }
+
+  // 3. Interleave the results back to single extended element.
+  Value finalInterleave;
+  if (srcDestBitwidthFactor == 2) {
+    finalInterleave = rewriter.create<vector::InterleaveOp>(loc, srsBitCastVals[0], srsBitCastVals[1]);
+  }else if (srcDestBitwidthFactor == 4) {
+    auto lowBitsInterleave = rewriter.create<vector::InterleaveOp>(loc, srsBitCastVals[0], srsBitCastVals[1]);
+    auto highBitsInterleave = rewriter.create<vector::InterleaveOp>(loc, srsBitCastVals[2], srsBitCastVals[3]);
+    finalInterleave = rewriter.create<vector::InterleaveOp>(loc, lowBitsInterleave, highBitsInterleave);
+  }else if (srcDestBitwidthFactor == 8) {
+    auto lowBitsRightInterleave = rewriter.create<vector::InterleaveOp>(loc, srsBitCastVals[0], srsBitCastVals[1]);
+    auto lowBitsLeftInterleave = rewriter.create<vector::InterleaveOp>(loc, srsBitCastVals[2], srsBitCastVals[3]);
+    auto highBitsRightInterleave = rewriter.create<vector::InterleaveOp>(loc, srsBitCastVals[4], srsBitCastVals[5]);
+    auto highBitsLeftInterleave = rewriter.create<vector::InterleaveOp>(loc, srsBitCastVals[6], srsBitCastVals[7]);
+
+    auto lowBitsInterleave = rewriter.create<vector::InterleaveOp>(loc, lowBitsRightInterleave, lowBitsLeftInterleave);
+    auto highBitsInterleave = rewriter.create<vector::InterleaveOp>(loc, highBitsRightInterleave, highBitsLeftInterleave);
+    finalInterleave = rewriter.create<vector::InterleaveOp>(loc, lowBitsInterleave, highBitsInterleave);
+  }else {
+    assert(false && "Unsupported srcDestBitwidthFactor");
+  }
+
+  return finalInterleave;
 }
 
 /// Rewrite the i8 -> i4 truncation into a sequence of shuffles and bitwise ops
@@ -1117,10 +1171,16 @@ struct RewriteAlignedSubByteIntExt : OpRewritePattern<ConversionOpType> {
 
   LogicalResult matchAndRewrite(ConversionOpType conversionOp,
                                 PatternRewriter &rewriter) const override {
+    llvm::dbgs() << "RewriteAlignedSubByteIntExt::matchAndRewrite() \n";
     // Verify the preconditions.
     Value srcValue = conversionOp.getIn();
     auto srcVecType = dyn_cast<VectorType>(srcValue.getType());
     auto dstVecType = dyn_cast<VectorType>(conversionOp.getType());
+
+    llvm::dbgs() <<"RewriteAlignedSubByteIntExt - srcVecType: " ;
+    srcVecType.dump();
+    llvm::dbgs() <<"RewriteAlignedSubByteIntExt - dstVecType: " ;
+    dstVecType.dump();
 
     if (failed(
             commonConversionPrecondition(rewriter, dstVecType, conversionOp)))
@@ -1272,6 +1332,7 @@ void vector::populateVectorNarrowTypeEmulationPatterns(
 
 void vector::populateVectorNarrowTypeRewritePatterns(
     RewritePatternSet &patterns, PatternBenefit benefit) {
+  llvm::dbgs() << "vector::populateVectorNarrowTypeRewritePatterns() \n";
   patterns.add<RewriteBitCastOfTruncI, RewriteExtOfBitCast<arith::ExtUIOp>,
                RewriteExtOfBitCast<arith::ExtSIOp>>(patterns.getContext(),
                                                     benefit);
